@@ -90,14 +90,28 @@ def create_session(
     api_key: str,
     title: str,
     timeout_sec: int,
+    model: str = "",
 ) -> str:
-    """POST /api/sessions -> session_id. One persistent session per run."""
+    """POST /api/sessions -> session_id. One persistent session per run.
+
+    IMPORTANT: the model MUST be set on the *create* call. The Hermes API
+    server advertises a virtual model name ("hermes-agent") and the
+    /api/sessions path persists it into the session row; that stored name
+    then takes precedence over config.model.default on every /chat turn and
+    gets sent verbatim to the provider — vLLM then 404s with
+    "The model hermes-agent does not exist". Passing the real model here
+    (e.g. GLM-4.7-W8A8) makes the stored session model correct. Passing it
+    only in the per-turn /chat body does NOT help — the stored row wins.
+    """
     url = f"{base_url}/api/sessions"
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    payload: Dict[str, Any] = {"title": title}
+    if model:
+        payload["model"] = model
     with httpx.Client(timeout=min(60.0, timeout_sec + 10.0)) as client:
-        resp = client.post(url, json={"title": title}, headers=headers)
+        resp = client.post(url, json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
     session_id = (
@@ -122,13 +136,9 @@ def extract_reply_text(body: Dict[str, Any]) -> str:
     if not isinstance(body, dict):
         return ""
 
-    # 1) flat string fields
-    for key in ("output", "response", "text", "content", "message", "reply"):
-        val = body.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-
-    # 2) message object: {"message": {"content": "..."]}} or content blocks
+    # 1) The authoritative field for /api/sessions/{id}/chat:
+    #    {"message": {"role": "assistant", "content": "..."}}
+    #    (verified against api_server.py:3431-3440). Check this FIRST.
     msg = body.get("message")
     if isinstance(msg, dict):
         content = msg.get("content")
@@ -143,6 +153,12 @@ def extract_reply_text(body: Dict[str, Any]) -> str:
             joined = "".join(parts).strip()
             if joined:
                 return joined
+
+    # 2) flat string fields (other endpoints / older versions)
+    for key in ("output", "response", "text", "content", "reply"):
+        val = body.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
 
     # 3) OpenAI-style choices[].message.content (chat/completions fallback)
     choices = body.get("choices")
@@ -285,9 +301,14 @@ def run_bench(args: argparse.Namespace) -> None:
     print(f"[hermes-bench] workspace: {workspace_root}")
     print(f"[hermes-bench] auth: {'bearer key' if api_key else 'NONE (likely misconfigured)'}")
 
-    # One persistent session for the whole run.
+    # One persistent session for the whole run. Pass the real model at
+    # CREATE time (see create_session docstring — the stored session model
+    # wins over config default and over per-turn model, so it must be set here).
     session_title = args.session_title or args.label
-    session_id = create_session(args.base_url, api_key, session_title, args.timeout_sec)
+    print(f"[hermes-bench] model: {args.model or '(gateway default — risks the hermes-agent 404 bug)'}")
+    session_id = create_session(
+        args.base_url, api_key, session_title, args.timeout_sec, model=args.model
+    )
     print(f"[hermes-bench] session_id: {session_id}")
 
     rows = []
@@ -339,7 +360,18 @@ def run_bench(args: argparse.Namespace) -> None:
             if not args.continue_on_error:
                 break
         else:
-            print(f"OK ({result['durationMs']}ms, {result['totalTokens']} tokens)")
+            # /api/sessions/{id}/chat returns HTTP 200 even when the agent
+            # turn failed (e.g. provider 404) — the error string lands in
+            # message.content with usage all zeros. Zero total tokens on a
+            # "successful" HTTP response is the tell-tale of that silent
+            # failure, so surface it loudly instead of recording a bogus row.
+            if result["totalTokens"] == 0:
+                print(
+                    f"WARN 0 tokens — likely a silent agent/provider failure. "
+                    f"Reply was: {result['replyText'][:160]!r}"
+                )
+            else:
+                print(f"OK ({result['durationMs']}ms, {result['totalTokens']} tokens)")
 
     ended_at = datetime.now().isoformat()
     summary = compute_summary(rows)
@@ -554,6 +586,7 @@ def main() -> None:
     run_parser.add_argument("--prompts", required=True, help="Prompts JSON file")
     run_parser.add_argument("--label", required=True, help="Run label for output files")
     run_parser.add_argument("--session-title", default="", help="Session title (defaults to --label)")
+    run_parser.add_argument("--model", default="", help="Real provider model to pin on session create (e.g. GLM-4.7-W8A8). REQUIRED to avoid the 'hermes-agent' 404 bug; must equal config.model.default")
     run_parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Hermes API server base URL")
     run_parser.add_argument("--api-key", default="", help="API_SERVER_KEY (or HERMES_API_KEY / API_SERVER_KEY env)")
     run_parser.add_argument("--timeout-sec", type=int, default=DEFAULT_TIMEOUT_SEC, help="Per-turn timeout")

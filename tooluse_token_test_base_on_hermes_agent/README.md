@@ -81,30 +81,44 @@ rm -f ~/.hermes/sessions/sessions.json             # 清会话索引
 ```bash
 WS=/root/test_code            # kubernetes 的父目录
 BASE=http://127.0.0.1:8642
+MODEL=GLM-4.7-W8A8            # 必须与 config.yaml 的 model.default 一致，见「模型名坑」
 
 # ── test1-base（先把 config.yaml 的 proactive_prune_tokens 设为 0，重启 gateway）──
 hermes memory reset --yes && rm -f ~/.hermes/state.db ~/.hermes/sessions/sessions.json
 # （重启 gateway）
-python run_hermes_bench.py run --prompts test1.json --label test1-base \
+python run_hermes_bench.py run --prompts test1.json --label test1-base --model $MODEL \
   --out-dir bench-results/t1-base --base-url $BASE --workspace-root $WS
 
 # ── test1-cand（把 proactive_prune_tokens 改为 48000，重启 gateway）──
 hermes memory reset --yes && rm -f ~/.hermes/state.db ~/.hermes/sessions/sessions.json
 # （重启 gateway）
-python run_hermes_bench.py run --prompts test1.json --label test1-cand \
+python run_hermes_bench.py run --prompts test1.json --label test1-cand --model $MODEL \
   --out-dir bench-results/t1-cand --base-url $BASE --workspace-root $WS
 
 python run_hermes_bench.py compare \
   --baseline bench-results/t1-base/test1-base-*.json \
   --candidate bench-results/t1-cand/test1-cand-*.json
 
-# ── test2 同理：base 阶段 prune=0，cand 阶段 prune=48000，各自 reset+重启 ──
-# python run_hermes_bench.py run --prompts test2.json --label test2-base ...
-# python run_hermes_bench.py run --prompts test2.json --label test2-cand ...
+# ── test2 同理：base 阶段 prune=0，cand 阶段 prune=48000，各自 reset+重启，都带 --model $MODEL ──
+# python run_hermes_bench.py run --prompts test2.json --label test2-base --model $MODEL ...
+# python run_hermes_bench.py run --prompts test2.json --label test2-cand --model $MODEL ...
 # python run_hermes_bench.py compare --baseline .../test2-base-*.json --candidate .../test2-cand-*.json
 ```
 
 > `compare` 用了 shell 通配符 `*.json`；若目录里有多个报告，改成具体文件名。
+
+### ⚠️ 模型名坑（必读）——`--model` 为什么是必填
+
+Hermes API server 对外广告一个**虚拟模型名 `hermes-agent`**（`GET /v1/models` 里那个），
+它不是真实模型。`/api/sessions` 这条路径有个 bug：创建 session 时若不指定 model，会把
+`hermes-agent` 存进 session，之后每轮 `/chat` 把它当**真实模型名**发给 vLLM，导致
+`404 The model hermes-agent does not exist`，且该错误被静默塞进回复、token 全记 0。
+
+规避：**创建 session 时（即本脚本的 `--model`）传真实模型名**（`GLM-4.7-W8A8`，须与
+`config.yaml` 的 `model.default` 一致）。只在 `/chat` body 里传没用——存进 session 的那个优先级更高。
+
+脚本已内置保护：若某轮 `totalTokens == 0`，会打印 `WARN 0 tokens ...` 并回显那段回复，
+方便你第一时间发现模型名/鉴权类静默失败，而不是收集到一堆全 0 的假数据。
 
 ## 五、指标与结论
 
@@ -123,6 +137,7 @@ diff / diffPercent。
 - **estimatedContextTokens / contextUsageRatio**：此 HTTP 路径不提供，恒为 0（与 qwenpaw 的
   `/console/chat` 路径一致），仅为保持 CSV 列一致而保留。
 - **compaction 启发式**：本轮 promptTokens < 上轮 ×0.7 记一次，与 qwenpaw 完全相同。
-- **回复文本字段**：首次跑若 `replyChars` 恒为 0，说明 Hermes 该版本的响应字段名不在探测列表里——
-  打印一次完整响应 body 确认字段，补进 `run_hermes_bench.py` 的 `extract_reply_text`。token 指标不受影响。
+- **回复文本字段**：`/api/sessions/{id}/chat` 的回复在 `message.content`，脚本已优先读它。
+  若某版本字段名不同导致 `replyChars` 恒为 0，打印一次完整响应 body 确认字段，补进
+  `run_hermes_bench.py` 的 `extract_reply_text`。token 指标不受此影响。
 
